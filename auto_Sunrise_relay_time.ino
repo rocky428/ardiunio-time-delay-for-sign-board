@@ -1,22 +1,19 @@
 // ═══════════════════════════════════════════════════════════════
 //  Solar irrigation relay controller  —  DS3231 + TimeLib + TimeAlarms
-//  v2  (2026-10-27)
+//  v3  (2026-11-18)
 //
-//  v2 changes vs v1:
-//   1. Equation of Time now converts ecliptic longitude -> right
-//      ascension first. Removes up to ~10 min seasonal error
-//      (verified < 0.3 min vs reference almanac for all of 2026).
-//   2. EEPROM "completed" marker: day-of-month (1 byte) replaced by
-//      a month*32+day stamp (2 bytes). Fixes:
-//        - the once-a-month false "already done" collision that
-//          skipped a legitimate catch-up,
-//        - midnight-crossing mis-marking (a catch-up running past
-//          midnight now marks the date the run BELONGED to).
-//   3. RTC.lostPower() detection: dead coin cell / first power-up
-//      seeds the clock from sketch compile time, warns loudly, and
-//      skips resume/catch-up watering on an untrusted clock.
-//   4. `while (!Serial);` replaced with a 2 s timeout so USB-native
-//      boards (Leonardo / Pro Micro) don't hang forever standalone.
+//  v3 changes vs v2:
+//   1. All Serial text wrapped in F() -> stored in flash, not RAM.
+//      Frees roughly 800-1000 bytes (v2 was at 91% RAM on an Uno/Nano).
+//   2. Catch-up cutoff times: a missed run is only caught up if the
+//      reboot happens before a cutoff (morning: noon, evening: 23:30).
+//      Stops a morning cycle starting in the middle of the night.
+//   3. Stale-clock check: if the RTC is more than 1 day BEHIND the
+//      sketch compile time, the clock is treated as untrusted (this
+//      is what happened when the DS3231 silently fell back 2 weeks).
+//
+//  Unchanged from v2: Equation-of-Time fix, month*32+day EEPROM
+//  completion stamps, RTC.lostPower() detection, Serial wait timeout.
 // ═══════════════════════════════════════════════════════════════
 
 #include <Wire.h>
@@ -38,11 +35,13 @@ const int MORNING_BEFORE_SUNRISE_MIN = 60;
 const int MORNING_DURATION_MIN       = 60;
 const int EVENING_DURATION_MIN       = 240;
 
+// Catch-up only if the reboot happens BEFORE these times (sec since midnight)
+const long MORNING_CATCHUP_UNTIL_SEC = 12L * 3600L;            // 12:00
+const long EVENING_CATCHUP_UNTIL_SEC = 23L * 3600L + 1800L;    // 23:30
+
 // ─── EEPROM: last completed run as (month*32+day) stamp ──────
 // 2 bytes each, little-endian. Blank EEPROM reads 0xFFFF, which can
-// never match a valid stamp (max 12*32+31 = 415), so a fresh chip
-// simply means "nothing completed yet". Old v1 single-byte data is
-// also safely ignored (it never decodes to a matching stamp).
+// never match a valid stamp (max 12*32+31 = 415).
 const int EEPROM_ADDR_MORNING = 0;   // bytes 0-1
 const int EEPROM_ADDR_EVENING = 2;   // bytes 2-3
 
@@ -118,11 +117,7 @@ float calcSunEvent(int yr, int mo, int dy, float lat, float lon, float tz, int t
   float sinDec = sin(23.439 * DEG_TO_RAD) * sin(lr);
   float dec    = asin(sinDec);
 
-  // ── Equation of Time (hours, apparent − mean) ─────────────
-  // EoT = mean longitude − RIGHT ASCENSION of the true sun.
-  // Converting ecliptic longitude -> right ascension is REQUIRED;
-  // the old shortcut (using longitude directly) caused up to ~10 min
-  // of seasonal error (e.g. ~9 min late in late October here).
+  // Equation of Time (hours): mean longitude minus RIGHT ASCENSION
   float epsR = 23.439 * DEG_TO_RAD;
   float ra   = atan2(cos(epsR) * sin(lr), cos(lr)) * RAD_TO_DEG;
   float dEq  = L - ra;
@@ -163,8 +158,8 @@ void printMinutes(int totalMin) {
   int h = totalMin / 60;
   int m = totalMin % 60;
   Serial.print(h);
-  Serial.print(":");
-  if (m < 10) Serial.print("0");
+  Serial.print(':');
+  if (m < 10) Serial.print('0');
   Serial.println(m);
 }
 
@@ -184,10 +179,12 @@ void calcTodayAlarms() {
   morningOnSec = (long)(morningMins  * 60);
   eveningOnSec = (long)(civilDuskMin * 60);
 
-  Serial.print("Sunrise      : "); printMinutes((int)sunriseMins);
-  Serial.print("Civil dusk   : "); printMinutes((int)civilDuskMin);
-  Serial.print("Morning ON   : "); printMinutes((int)morningMins);
-  Serial.print("Evening ON   : "); printMinutes((int)civilDuskMin);
+  Serial.print(F("Date         : "));
+  Serial.print(dy); Serial.print('/'); Serial.print(mo); Serial.print('/'); Serial.println(yr);
+  Serial.print(F("Sunrise      : ")); printMinutes((int)sunriseMins);
+  Serial.print(F("Civil dusk   : ")); printMinutes((int)civilDuskMin);
+  Serial.print(F("Morning ON   : ")); printMinutes((int)morningMins);
+  Serial.print(F("Evening ON   : ")); printMinutes((int)civilDuskMin);
 
   lastCalcDay = dy;
 
@@ -208,20 +205,18 @@ void calcTodayAlarms() {
   morningAlarmID = Alarm.alarmRepeat(mH, mM, 0, MorningAlarm);
   eveningAlarmID = Alarm.alarmRepeat(eH, eM, 0, EveningAlarm);
 
-  Serial.print("Alarms set -> Morning ");
-  Serial.print(mH); Serial.print(":"); if (mM < 10) Serial.print("0"); Serial.print(mM);
-  Serial.print("  Evening ");
-  Serial.print(eH); Serial.print(":"); if (eM < 10) Serial.print("0"); Serial.println(eM);
+  Serial.print(F("Alarms set -> Morning "));
+  Serial.print(mH); Serial.print(':'); if (mM < 10) Serial.print('0'); Serial.print(mM);
+  Serial.print(F("  Evening "));
+  Serial.print(eH); Serial.print(':'); if (eM < 10) Serial.print('0'); Serial.println(eM);
 }
 
 // ════════════════════════════════════════════════════════════
 //  POWER CUT / RESET RECOVERY
-//  1) If boot happens INSIDE a window -> resume mid-way
-//  2) If boot happens AFTER a window has fully closed AND that window
-//     never completed today (per EEPROM stamp) -> CATCH UP: turn relay
-//     on now and run it for the FULL configured duration.
-//  Skipped entirely if the RTC clock was just re-seeded (lostPower),
-//  because no watering decision should be made on an untrusted clock.
+//  1) Boot INSIDE a window            -> resume mid-way
+//  2) Boot AFTER a window closed, run never completed today (EEPROM
+//     stamp) AND still before the catch-up cutoff -> run FULL duration
+//  Skipped entirely if the RTC clock is untrusted.
 // ════════════════════════════════════════════════════════════
 void checkRelayRecovery(bool timeTrustworthy) {
   DateTime dt = RTC.now();
@@ -232,23 +227,22 @@ void checkRelayRecovery(bool timeTrustworthy) {
   long morningOffSec = morningOnSec + MORNING_DURATION_MIN * 60L;
   long eveningOffSec = eveningOnSec + EVENING_DURATION_MIN * 60L;
 
-  Serial.print("Boot time (sec since midnight): ");
+  Serial.print(F("Boot time (sec since midnight): "));
   Serial.println(nowSec);
-  Serial.print("Morning window: ");
-  Serial.print(morningOnSec); Serial.print(" -> "); Serial.println(morningOffSec);
-  Serial.print("Evening window: ");
-  Serial.print(eveningOnSec); Serial.print(" -> "); Serial.println(eveningOffSec);
+  Serial.print(F("Morning window: "));
+  Serial.print(morningOnSec); Serial.print(F(" -> ")); Serial.println(morningOffSec);
+  Serial.print(F("Evening window: "));
+  Serial.print(eveningOnSec); Serial.print(F(" -> ")); Serial.println(eveningOffSec);
 
   if (!timeTrustworthy) {
-    Serial.println("!! RTC was just re-seeded - clock NOT trustworthy.");
-    Serial.println("!! Skipping resume/catch-up this boot (no watering decisions on a bad clock).");
+    Serial.println(F("!! RTC untrusted - skipping resume/catch-up this boot."));
     return;
   }
 
   bool morningDone = morningCompletedOn(todayStamp);
   bool eveningDone = eveningCompletedOn(todayStamp);
-  Serial.print("Morning already completed today: "); Serial.println(morningDone ? "YES" : "NO");
-  Serial.print("Evening already completed today: "); Serial.println(eveningDone ? "YES" : "NO");
+  Serial.print(F("Morning already completed today: ")); Serial.println(morningDone ? F("YES") : F("NO"));
+  Serial.print(F("Evening already completed today: ")); Serial.println(eveningDone ? F("YES") : F("NO"));
 
   bool didSomething = false;
 
@@ -258,20 +252,20 @@ void checkRelayRecovery(bool timeTrustworthy) {
     relayMorningActive = true;
     relayOnTimeMorning = now() - (nowSec - morningOnSec);
     morningRunStamp    = todayStamp;
-    Serial.println(">>> RECOVERED: Morning relay ON after power cut (resumed mid-window)");
-    Serial.print("Time already elapsed (min): ");
+    Serial.println(F(">>> RECOVERED: Morning relay ON (resumed mid-window)"));
+    Serial.print(F("Elapsed (min): "));
     Serial.println((nowSec - morningOnSec) / 60);
-    Serial.print("Remaining (min): ");
+    Serial.print(F("Remaining (min): "));
     Serial.println((morningOffSec - nowSec) / 60);
     didSomething = true;
   }
-  // ── Morning: boot AFTER window closed AND never completed today -> catch up ──
-  else if (nowSec >= morningOffSec && !morningDone) {
+  // ── Morning: missed, not completed, before cutoff -> catch up ──
+  else if (nowSec >= morningOffSec && nowSec < MORNING_CATCHUP_UNTIL_SEC && !morningDone) {
     digitalWrite(RELAY, LOW);
     relayMorningActive = true;
     relayOnTimeMorning = now();      // full fresh duration starts now
     morningRunStamp    = todayStamp;
-    Serial.println(">>> CATCH-UP: Morning window was missed entirely - running full duration now");
+    Serial.println(F(">>> CATCH-UP: Morning run missed - running full duration now"));
     didSomething = true;
   }
 
@@ -281,33 +275,30 @@ void checkRelayRecovery(bool timeTrustworthy) {
     relayEveningActive = true;
     relayOnTimeEvening = now() - (nowSec - eveningOnSec);
     eveningRunStamp    = todayStamp;
-    Serial.println(">>> RECOVERED: Evening relay ON after power cut (resumed mid-window)");
-    Serial.print("Time already elapsed (min): ");
+    Serial.println(F(">>> RECOVERED: Evening relay ON (resumed mid-window)"));
+    Serial.print(F("Elapsed (min): "));
     Serial.println((nowSec - eveningOnSec) / 60);
-    Serial.print("Remaining (min): ");
+    Serial.print(F("Remaining (min): "));
     Serial.println((eveningOffSec - nowSec) / 60);
     didSomething = true;
   }
-  // ── Evening: boot AFTER window closed AND never completed today -> catch up ──
-  else if (nowSec >= eveningOffSec && !eveningDone) {
+  // ── Evening: missed, not completed, before cutoff -> catch up ──
+  else if (nowSec >= eveningOffSec && nowSec < EVENING_CATCHUP_UNTIL_SEC && !eveningDone) {
     digitalWrite(RELAY, LOW);
     relayEveningActive = true;
     relayOnTimeEvening = now();      // full fresh duration starts now
     eveningRunStamp    = todayStamp;
-    Serial.println(">>> CATCH-UP: Evening window was missed entirely - running full duration now");
+    Serial.println(F(">>> CATCH-UP: Evening run missed - running full duration now"));
     didSomething = true;
   }
 
   if (!didSomething) {
-    Serial.println("Boot outside any ON window and today's cycles already completed - relay stays OFF");
+    Serial.println(F("No resume/catch-up needed - relay stays OFF"));
   }
 
-  // NOTE: relayMorningActive and relayEveningActive can technically both be
-  // true at once during a catch-up (e.g. reboot very late at night after
-  // BOTH windows were missed). Since there is only one physical relay pin,
-  // if that happens the relay stays ON until BOTH durations have elapsed -
-  // the loop()'s OFF logic below only writes RELAY HIGH once neither flag
-  // is active-and-unexpired, so this is handled safely, just FYI.
+  // NOTE: both flags can be active at once (e.g. catch-up of one run while
+  // the other window is open). There is one relay pin, so loop() only
+  // writes RELAY HIGH once neither run is still active.
 }
 
 // ─── Setup ───────────────────────────────────────────────────
@@ -318,32 +309,34 @@ void setup() {
   Serial.begin(9600);
 
   // Wait up to 2 s for the serial monitor, then continue anyway.
-  // (A bare `while (!Serial);` hangs USB-native boards forever when
-  //  powered standalone - fatal for an unattended controller.)
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0 < 2000UL)) {}
 
   if (!RTC.begin()) {
-    Serial.println("RTC not found! Check wiring.");
+    Serial.println(F("RTC not found! Check wiring."));
     while (1);
   }
-  Serial.println("RTC OK");
+  Serial.println(F("RTC OK"));
 
-  // Detect RTC power loss (dead coin cell, first-ever power-up, or a
-  // power cut with no battery backup). The clock is then invalid, so
-  // seed it from the sketch compile time and flag it untrusted.
+  // Clock trust checks:
+  //  a) RTC.lostPower()  -> oscillator stopped (dead CR2032 / first power-up)
+  //  b) RTC more than 1 day behind the sketch compile time -> stale clock
   bool timeTrustworthy = true;
+  DateTime compiled(F(__DATE__), F(__TIME__));
+
   if (RTC.lostPower()) {
     timeTrustworthy = false;
-    Serial.println("================================================");
-    Serial.println("!! RTC LOST POWER - clock was invalid.");
-    Serial.println("!! Seeding from sketch compile time, which is NOT");
-    Serial.println("!! necessarily today. Please set the correct time");
-    Serial.println("!! and replace the CR2032 backup battery.");
-    Serial.println("!! Resume/CATCH-UP watering is DISABLED this boot");
-    Serial.println("!! for safety; normal alarms will still run.");
-    Serial.println("================================================");
-    RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    Serial.println(F("!! RTC LOST POWER - clock invalid."));
+  } else if (RTC.now().unixtime() + 86400UL < compiled.unixtime()) {
+    timeTrustworthy = false;
+    Serial.println(F("!! RTC is far BEHIND compile time - clock stale."));
+  }
+
+  if (!timeTrustworthy) {
+    Serial.println(F("!! Seeding clock from compile time (may not be today)."));
+    Serial.println(F("!! Set the correct time and replace the CR2032."));
+    Serial.println(F("!! Resume/catch-up disabled this boot; alarms still run."));
+    RTC.adjust(compiled);
   }
 
   setSyncProvider(getTime);
@@ -355,9 +348,9 @@ void setup() {
     retries++;
   }
   if (timeStatus() != timeSet) {
-    Serial.println("WARNING: TimeLib sync failed, using RTC directly");
+    Serial.println(F("WARNING: TimeLib sync failed, using RTC directly"));
   } else {
-    Serial.println("TimeLib synced from RTC");
+    Serial.println(F("TimeLib synced from RTC"));
   }
 
   calcTodayAlarms();                    // sets morningOnSec + eveningOnSec FIRST
@@ -371,7 +364,7 @@ void loop() {
 
   DateTime dt = RTC.now();
   if (dt.day() != lastCalcDay) {
-    Serial.println("New day - recalculating solar times...");
+    Serial.println(F("New day - recalculating solar times..."));
     calcTodayAlarms();
   }
 
@@ -380,7 +373,7 @@ void loop() {
     relayMorningActive = false;
     writeStamp(EEPROM_ADDR_MORNING, morningRunStamp);   // mark the run's date, not "now"
     if (!relayEveningActive) digitalWrite(RELAY, HIGH); // don't cut evening off early
-    Serial.println("Morning OFF");
+    Serial.println(F("Morning OFF"));
   }
 
   // Evening OFF
@@ -388,14 +381,14 @@ void loop() {
     relayEveningActive = false;
     writeStamp(EEPROM_ADDR_EVENING, eveningRunStamp);   // mark the run's date, not "now"
     if (!relayMorningActive) digitalWrite(RELAY, HIGH); // don't cut morning off early
-    Serial.println("Evening OFF");
+    Serial.println(F("Evening OFF"));
   }
 }
 
 // ─── Alarm callbacks ─────────────────────────────────────────
 void MorningAlarm() {
   DateTime dt = RTC.now();
-  Serial.println("Morning ON");
+  Serial.println(F("Morning ON"));
   digitalWrite(RELAY, LOW);
   relayMorningActive = true;
   relayOnTimeMorning = now();
@@ -404,7 +397,7 @@ void MorningAlarm() {
 
 void EveningAlarm() {
   DateTime dt = RTC.now();
-  Serial.println("Evening ON");
+  Serial.println(F("Evening ON"));
   digitalWrite(RELAY, LOW);
   relayEveningActive = true;
   relayOnTimeEvening = now();
@@ -420,7 +413,7 @@ void digitalClockDisplay() {
 }
 
 void printDigits(int digits) {
-  Serial.print(":");
-  if (digits < 10) Serial.print("0");
+  Serial.print(':');
+  if (digits < 10) Serial.print('0');
   Serial.print(digits);
 }
