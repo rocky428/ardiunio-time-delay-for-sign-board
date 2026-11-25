@@ -5,4 +5,6 @@ time-delay for sign board for auto on,off at mornig and evening -Based on TimeAl
 2. Upload updated new_relay.ino code. 
 
 first upload time_set_ic_RTC_DS3231.ino
+and again upload code but comment out this part "//rtc.adjust(DateTime(2026, 11, 25, 20, 52, 0));" so every time the board resets (an upload, power on, or the reset button), the RTC is did not go back to 12/11/2026 20:52:00.
+
 second upload auto_Sunrise_relay_time.ino
